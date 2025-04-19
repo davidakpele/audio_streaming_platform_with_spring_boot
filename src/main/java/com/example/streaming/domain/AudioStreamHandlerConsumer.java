@@ -2,15 +2,15 @@ package com.example.streaming.domain;
 
 import java.io.IOException;
 import java.net.URI;
-import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.ArrayList;
-import java.util.Base64;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
@@ -70,9 +70,6 @@ public class AudioStreamHandlerConsumer extends AbstractWebSocketHandler {
     @Autowired
     private RedisTemplate<String, String> stringRedisTemplate;
 
-    @Autowired
-    private RedisTemplate<String, byte[]> redisBinaryPublisher;
-
     @Override
     public void afterConnectionEstablished(WebSocketSession session) throws IOException {
         URI uri = session.getUri();
@@ -119,19 +116,19 @@ public class AudioStreamHandlerConsumer extends AbstractWebSocketHandler {
         String senderSessionId = senderSession.getId();
         byte[] audioData = message.getPayload().array();
 
-        // ✅ 1. Validate payload size (optional, prevents spam/flood)
-        int MAX_FRAME_SIZE = 4096 * 2; // 4096 samples * 2 bytes (16-bit audio)
+    
+        int MAX_FRAME_SIZE = 4096 * 2; 
         if (audioData.length > MAX_FRAME_SIZE) {
             System.out.println("❌ Frame too large. Skipping...");
             return;
         }
 
-        // ✅ 2. (Optional) Silence detection - only if you want server-side filtering
-        
+        // Silence detection - only if you want server-side filtering
         boolean isSilent = true;
         for (int i = 0; i < audioData.length; i += 2) {
             short sample = (short) ((audioData[i + 1] << 8) | (audioData[i] & 0xFF));
-            if (Math.abs(sample) > 500) { // Adjust threshold as needed
+            // Adjust threshold as needed
+            if (Math.abs(sample) > 500) { 
                 isSilent = false;
                 break;
             }
@@ -141,22 +138,21 @@ public class AudioStreamHandlerConsumer extends AbstractWebSocketHandler {
             return;
         }
        
-
-        // ✅ 3. Find which room the sender belongs to
+        // Find which room the sender belongs to
         String roomId = findRoomForSession(senderSessionId);
         if (roomId == null) {
             System.out.println("❌ No room found for session: " + senderSessionId);
             return;
         }
 
-        // ✅ 4. Get all active participants in the room
+        // Get all active participants in the room
         List<WebSocketSession> recipients = getRoomParticipants(roomId, senderSessionId);
         if (recipients.isEmpty()) {
             System.out.println("⚠️ No active participants in room: " + roomId);
             return;
         }
 
-        // ✅ 5. Broadcast audio to all participants (no clone needed unless modifying audioData)
+        //  Broadcast audio to all participants 
         BinaryMessage audioMessage = new BinaryMessage(audioData);
         for (WebSocketSession recipient : recipients) {
             try {
@@ -171,13 +167,11 @@ public class AudioStreamHandlerConsumer extends AbstractWebSocketHandler {
 
     }
 
-
     // Helper method to find room for a session
     private String findRoomForSession(String sessionId) {
         Set<String> roomKeys = stringRedisTemplate.keys("event_room:*");
         if (roomKeys == null)
             return null;
-
         ObjectMapper mapper = new ObjectMapper();
         for (String roomKey : roomKeys) {
             String roomJson = stringRedisTemplate.opsForValue().get(roomKey);
@@ -189,7 +183,7 @@ public class AudioStreamHandlerConsumer extends AbstractWebSocketHandler {
                 });
 
                 // Check host session
-                String hostSessionId = (String) roomData.get("sessionId");
+                String hostSessionId = (String) roomData.get("hostSessionId");
                 if (sessionId.equals(hostSessionId)) {
                     return (String) roomData.get("roomId");
                 }
@@ -211,6 +205,7 @@ public class AudioStreamHandlerConsumer extends AbstractWebSocketHandler {
         }
         return null;
     }
+
 
     // Helper method to get all active participants in a room
     private List<WebSocketSession> getRoomParticipants(String roomId, String excludeSessionId) {
@@ -255,12 +250,13 @@ public class AudioStreamHandlerConsumer extends AbstractWebSocketHandler {
         return participants;
     }
 
+    
     // Helper method to clean up disconnected sessions
     private void cleanupDisconnectedSession(String sessionId) {
         sessionManager.removeSession(sessionId);
-        // Additional cleanup logic if needed
     }
  
+
     @Override
     protected void handleTextMessage(WebSocketSession session, TextMessage message) throws Exception {
         try {
@@ -280,23 +276,51 @@ public class AudioStreamHandlerConsumer extends AbstractWebSocketHandler {
             }
 
             if (type.equals("stream_ended")) {
+                // Redis key
+                String redisKey = "event_room:" + eventId;
+                String eventJson = stringRedisTemplate.opsForValue().get(redisKey);
+                if (eventJson == null || eventJson.isEmpty()) {
+                    sendErrorAndClose(session, "Room not found", "This event room doesn't exist or has no host details.");
+                    return;
+                }
+                
                 Event eventOpt = event.get();
-               // endEvent(eventOpt);
+                endEvent(eventOpt);
+
+                stringRedisTemplate.delete(redisKey);
             }
 
             if (type.equals("invite_cohost")) {
-                // String participantId = extractParticipantIdFromSession(session);
-                // handleInviteCohost(eventId, participantId, session);
+                String participantId = (String) payload.get("user_id");
+                handleUserInviteCohost(eventId, participantId);
             }
+
             if (type.equals("accept_cohost")) {
-                // handleAcceptCohost(event, session);
+                String participantId = (String) payload.get("user_id");
+                handleUserAcceptCohost(eventId, participantId);
             }
+
             if (type.equals("leave_room")) {
-               // handleChatMessage(event, json.get("message").asText(), session);
+                String participantId = (String) payload.get("user_id");
+                handleUserExistRoom(eventId, participantId);
+            }
+
+            if (type.equals("remove_user_in_room")) {
+                String participantId = (String) payload.get("user_id");
+                handleRemoveUserFromRoomByHost(eventId, participantId);
+            }
+
+            if (type.equals("remove_cohost")) {
+                String participantId = (String) payload.get("user_id");
+                handleRemoveCohost(eventId, participantId);
             }
             
-            if (type.equals("text_message") || type.equals("chat")) {
-                // handleChatMessage(event, json.get("message").asText(), session);
+            if ("chat_message".equals(type) || type.equals("text_message") || type.equals("chat") || "broadcast_message".equals(type)) {
+                String textMessage = (String) payload.get("message");
+                String participantId = (String) payload.get("participant_id");
+                if (textMessage != null && !textMessage.trim().isEmpty()) {
+                    handleChatMessage(eventId, textMessage.trim(), participantId);
+                }
             }
 
         } catch (Exception e) {
@@ -310,6 +334,7 @@ public class AudioStreamHandlerConsumer extends AbstractWebSocketHandler {
         sessions.remove(session.getId());
     }
 
+   
     private void handleHostConnection(WebSocketSession session, String userId, String token) throws IOException {
         // JWT validation
         if (token == null || token.isEmpty()) {
@@ -321,7 +346,7 @@ public class AudioStreamHandlerConsumer extends AbstractWebSocketHandler {
             sendErrorAndClose(session, "Invalid token", "Invalid or expired token");
             return;
         }
-
+        
         String extractedUserId = jwtTokenProvider.getUserIdFromJWT(token);
 
         if (!extractedUserId.equals(userId)) {
@@ -339,39 +364,52 @@ public class AudioStreamHandlerConsumer extends AbstractWebSocketHandler {
 
         activeEvents.put(event.getRoomId(), event);
 
+        // Prepare session data
         String sessionId = session.getId();
-    
+        session.getAttributes().put("userId", userId);
+        session.getAttributes().put("isHost", true);
+        session.getAttributes().put("eventId", event.getRoomId());
+
         long userIdLong = Long.parseLong(userId);
-        
+
         Optional<Users> users = userRepository.findById(userIdLong);
-        if(!users.isPresent()){
+        if (!users.isPresent()) {
             sendErrorAndClose(session, "User not found",
                     "User not found");
             return;
         }
-
+        // Store host details
         Map<String, Object> hostDetails = new HashMap<>();
         hostDetails.put("userId", userId);
-        hostDetails.put("username", users.get().getUsername()); 
+        hostDetails.put("username", users.get().getUsername());
         hostDetails.put("startedAt", Instant.now().toString());
-
+        // Store event data
         Map<String, Object> eventData = new HashMap<>();
-        eventData.put("sessionId", sessionId);
+        eventData.put("hostSessionId", sessionId); // Explicit host session ID
         eventData.put("roomId", event.getRoomId());
+        eventData.put("hostId", userId); // Store host ID separately
         eventData.put("hostDetails", hostDetails);
-        eventData.put("participants", new HashMap<>()); // Start with empty participant map
+        eventData.put("participants", new HashMap<>());
+        eventData.put("total_participants", 0);
 
+        // Store in Redis
         String redisKey = "event_room:" + event.getRoomId();
         stringRedisTemplate.opsForValue().set(redisKey, new ObjectMapper().writeValueAsString(eventData));
-        
+
+        // Store host session separately
+        stringRedisTemplate.opsForValue().set("event_host_session:" + userId, sessionId);
+        sessionManager.addSession(sessionId, session);
+
         // Store in memory
         sessions.put(sessionId, session);
         sessionToEventMap.put(sessionId, event.getRoomId());
-        String joinUrl = generateStreamingLink(event.getRoomId(), userId);
+
         // Send stream link
+        String joinUrl = generateStreamingLink(event.getRoomId(), userId);
         sendMessage(session, new StreamLinkMessage("stream_link", event.getRoomId(), joinUrl));
     }
 
+    
     private void handleParticipantConnection(WebSocketSession session, String eventId, String participantId,
             String username) throws IOException {
         // 1. Validate event exists and is active
@@ -429,6 +467,7 @@ public class AudioStreamHandlerConsumer extends AbstractWebSocketHandler {
                 participantData.put("joinedAt", Instant.now().toString());
                 participantData.put("sessionId", session.getId());
                 participantData.put("isReconnect", false);
+                participantData.put("is_cohost", false);
                 participantsMap.put(nextIndex, participantData);
 
                 // Update participant count
@@ -477,12 +516,14 @@ public class AudioStreamHandlerConsumer extends AbstractWebSocketHandler {
             broadcastMessage(eventId, joinMessage, displayName, participantId);
             broadcastParticipantList(eventId);
             broadcastParticipantCount(eventId);
+            sendChatHistory(eventId, participantId);
 
         } catch (Exception e) {
             sendErrorAndClose(session, "Connection error", "Failed to establish connection");
         }
     }
 
+    
     public void broadcastMessage(String roomId, String message, String username, String userId) {
         // Create the message payload
         Map<String, Object> payload = new HashMap<>();
@@ -524,9 +565,6 @@ public class AudioStreamHandlerConsumer extends AbstractWebSocketHandler {
                 // Get the WebSocket session for this participant
                 String sessionKey = "event_participant_session:" + participantId;
                 String sessionId = stringRedisTemplate.opsForValue().get(sessionKey);
-                System.out.println("sess "+sessionId);
-                System.out.println("key "+sessionKey);
-
                 // 2. Get the actual WebSocket session
                 if (sessionId != null) {
                     WebSocketSession session = sessionManager.getSession(sessionId);
@@ -541,22 +579,23 @@ public class AudioStreamHandlerConsumer extends AbstractWebSocketHandler {
         }
     }
 
-
+    
     private void broadcastParticipantList(String eventId) {
         try {
             // 1. Get room data from Redis
             String redisKey = "event_room:" + eventId;
             String eventJson = stringRedisTemplate.opsForValue().get(redisKey);
-
+            
             if (eventJson == null || eventJson.isEmpty()) {
                 return;
             }
-
+            
             // 2. Parse the room data
             ObjectMapper mapper = new ObjectMapper();
             Map<String, Object> roomData = mapper.readValue(eventJson, new TypeReference<Map<String, Object>>() {
             });
-
+           
+    
             Map<Integer, Map<String, Object>> participantsMap = (Map<Integer, Map<String, Object>>) roomData.get("participants");
 
             if (participantsMap == null || participantsMap.isEmpty()) {
@@ -569,6 +608,7 @@ public class AudioStreamHandlerConsumer extends AbstractWebSocketHandler {
                         Map<String, Object> simplified = new HashMap<>();
                         simplified.put("id", participant.get("participantId"));
                         simplified.put("username", participant.get("username"));
+                        simplified.put("is_cohost", participant.get("is_cohost"));
                         simplified.put("joinedAt", participant.get("joinedAt"));
                         return simplified;
                     })
@@ -586,7 +626,7 @@ public class AudioStreamHandlerConsumer extends AbstractWebSocketHandler {
                 String participantId = (String) participant.get("participantId");
                 String sessionKey = "event_participant_session:" + participantId;
                 String sessionId = stringRedisTemplate.opsForValue().get(sessionKey);
-
+              
                 if (sessionId != null) {
                     WebSocketSession session = sessionManager.getSession(sessionId);
                     if (session != null && session.isOpen()) {
@@ -602,22 +642,25 @@ public class AudioStreamHandlerConsumer extends AbstractWebSocketHandler {
 
             // 5. Send to host
             Map<String, Object> hostDetails = (Map<String, Object>) roomData.get("hostDetails");
-
+     
             if (hostDetails != null) {
-                String hostUserId = String.valueOf(hostDetails.get("userId"));
-                String hostSessionKey = "event_participant_session:" + hostUserId;
+                String hostSessionKey = "event_host_session:" + roomData.get("hostId");
                 String hostSessionId = stringRedisTemplate.opsForValue().get(hostSessionKey);
-
                 if (hostSessionId != null) {
                     WebSocketSession hostSession = sessionManager.getSession(hostSessionId);
+                    // Get session from memory
                     if (hostSession != null && hostSession.isOpen()) {
                         try {
                             hostSession.sendMessage(textMessage);
                         } catch (IOException e) {
-                            stringRedisTemplate.delete(hostSessionKey);
-                            sessionManager.removeSession(hostSessionId);
+                            // Clean up on failure
+                            System.out.println("Failed to send to host participants list");
                         }
+                    } else {
+                        System.out.println("Host WebSocketSession is null or closed");
                     }
+                } else {
+                    System.out.println("Session ID not found in Redis for host user ID: " + hostSessionId);
                 }
             }
 
@@ -628,67 +671,79 @@ public class AudioStreamHandlerConsumer extends AbstractWebSocketHandler {
         }
     }
 
+    
     private void broadcastParticipantCount(String eventId) {
         try {
-            // 1. Get room data from Redis
+            // 1. Get room data
             String redisKey = "event_room:" + eventId;
             String eventJson = stringRedisTemplate.opsForValue().get(redisKey);
-
             if (eventJson == null || eventJson.isEmpty()) {
-                //log.warn("Room not found in Redis: {}", eventId);
                 return;
             }
 
-            // 2. Parse the room data and extract count
+            // 2. Parse data
             ObjectMapper mapper = new ObjectMapper();
-            Map<String, Object> roomData = mapper.readValue(eventJson, new TypeReference<Map<String, Object>>() {
+            Map<String, Object> roomData = mapper.readValue(eventJson, new TypeReference<>() {
             });
             int participantCount = ((Number) roomData.getOrDefault("total_participants", 0)).intValue();
 
-            // 3. Prepare the count payload
+            // 3. Prepare message
             Map<String, Object> payload = new HashMap<>();
             payload.put("type", "participant_count");
             payload.put("count", participantCount);
-
             String jsonMessage = mapper.writeValueAsString(payload);
             TextMessage textMessage = new TextMessage(jsonMessage);
 
-            // 4. Get participants from room data
-            Map<Integer, Map<String, Object>> participantsMap = (Map<Integer, Map<String, Object>>) roomData
-                    .get("participants");
-            if (participantsMap == null || participantsMap.isEmpty()) {
-                //log.debug("No participants found in room: {}", eventId);
-                return;
-            }
-
-            // 5. Broadcast to all participants
-            for (Map<String, Object> participant : participantsMap.values()) {
-                String participantId = (String) participant.get("participantId");
-                String sessionKey = "event_participant_session:" + participantId;
-                String sessionId = stringRedisTemplate.opsForValue().get(sessionKey);
-
-                if (sessionId != null) {
-                    WebSocketSession session = sessionManager.getSession(sessionId);
-                    if (session != null && session.isOpen()) {
-                        try {
-                            session.sendMessage(textMessage);
-                            //log.debug("Sent participant count to {}", participantId);
-                        } catch (IOException e) {
-                           // log.error("Failed to send to participant {}: {}", participantId, e.getMessage());
-                            // Clean up disconnected session
-                            stringRedisTemplate.delete(sessionKey);
-                            sessionManager.removeSession(sessionId);
+            // 4. Send to host first (same approach as broadcastParticipantList)
+            Map<String, Object> hostDetails = (Map<String, Object>) roomData.get("hostDetails");
+            if (hostDetails != null) {
+                String hostId = (String) roomData.get("hostId");
+                if (hostId != null) {
+                    String hostSessionKey = "event_host_session:" + hostId;
+                    String hostSessionId = stringRedisTemplate.opsForValue().get(hostSessionKey);
+                    if (hostSessionId != null) {
+                        WebSocketSession hostSession = sessionManager.getSession(hostSessionId);
+                        if (hostSession != null && hostSession.isOpen()) {
+                            try {
+                                hostSession.sendMessage(textMessage);
+                            } catch (IOException e) {
+                                System.out.println("Failed to send to host: " + e.getMessage());
+                                stringRedisTemplate.delete(hostSessionKey);
+                                sessionManager.removeSession(hostSessionId);
+                            }
                         }
                     }
                 }
             }
-        } catch (JsonProcessingException e) {
-            //log.error("JSON processing error while broadcasting participant count: {}", e.getMessage());
+
+            // 5. Send to participants
+            Map<Integer, Map<String, Object>> participantsMap = (Map<Integer, Map<String, Object>>) roomData
+                    .get("participants");
+            if (participantsMap != null) {
+                for (Map<String, Object> participant : participantsMap.values()) {
+                    String participantId = (String) participant.get("participantId");
+                    String sessionKey = "event_participant_session:" + participantId;
+                    String sessionId = stringRedisTemplate.opsForValue().get(sessionKey);
+
+                    if (sessionId != null) {
+                        WebSocketSession session = sessionManager.getSession(sessionId);
+                        if (session != null && session.isOpen()) {
+                            try {
+                                session.sendMessage(textMessage);
+                            } catch (IOException e) {
+                                stringRedisTemplate.delete(sessionKey);
+                                sessionManager.removeSession(sessionId);
+                            }
+                        }
+                    }
+                }
+            }
         } catch (Exception e) {
-           // log.error("Unexpected error broadcasting participant count: {}", e.getMessage());
+            System.out.println("Broadcast error: " + e.getMessage());
         }
     }
-
+    
+    
     // Updated implementation that gets user details internally
     private String generateStreamingLink(String eventId, String userId) {
         long userIdLong = Long.parseLong(userId);
@@ -701,6 +756,7 @@ public class AudioStreamHandlerConsumer extends AbstractWebSocketHandler {
                 currentUser.getUsername(),
                 currentUser.getId());
     }
+    
     
     // Utility methods
     private Map<String, String> extractPathVariables(URI uri) {
@@ -719,6 +775,7 @@ public class AudioStreamHandlerConsumer extends AbstractWebSocketHandler {
         return pathVariables;
     }
 
+    
     private String extractTokenFromQuery(String query) {
         if (query == null || query.isEmpty()) {
             return null;
@@ -733,6 +790,7 @@ public class AudioStreamHandlerConsumer extends AbstractWebSocketHandler {
         return null;
     }
 
+    
     private void sendErrorAndClose(WebSocketSession session, String message, String details) {
         try {
             Map<String, Object> error = new HashMap<>();
@@ -762,6 +820,7 @@ public class AudioStreamHandlerConsumer extends AbstractWebSocketHandler {
         }
     }
 
+    
     private void sendMessage(WebSocketSession session, Object message) throws IOException {
         try {
             ObjectMapper mapper = new ObjectMapper();
@@ -772,6 +831,7 @@ public class AudioStreamHandlerConsumer extends AbstractWebSocketHandler {
         }
     }
 
+    
     public String getEventHost(String eventId) {
         String redisKey = "event:" + eventId;
         String json = stringRedisTemplate.opsForValue().get(redisKey);
@@ -789,6 +849,7 @@ public class AudioStreamHandlerConsumer extends AbstractWebSocketHandler {
         }
     }
 
+    
     public boolean isCohost(String eventId, String participantId) {
         String redisKey = "event:" + eventId;
         String json = stringRedisTemplate.opsForValue().get(redisKey);
@@ -814,5 +875,706 @@ public class AudioStreamHandlerConsumer extends AbstractWebSocketHandler {
         return false;
     }
 
+    
+    private void endEvent(Event event) {
+        String eventId = event.getRoomId();
 
+        // 1. First broadcast the event ending
+        Map<String, Object> endPayload = new HashMap<>();
+        endPayload.put("type", "event_ended");
+        endPayload.put("message", "Host has ended the event");
+        endPayload.put("timestamp", Instant.now().toString());
+
+        // Broadcast to all active sessions
+        broadcastToAllSessions(eventId, endPayload);
+
+        // 2. Then update database
+        event.setStatus(EventStatus.ended);
+        event.setEndTimestamp(Instant.now());
+        eventRepository.save(event);
+    }
+
+    
+    // Enhanced broadcast method
+    private void broadcastToAllSessions(String eventId, Object payload) {
+        try {
+            String redisKey = "event_room:" + eventId;
+            String eventJson = stringRedisTemplate.opsForValue().get(redisKey);
+
+            if (eventJson == null || eventJson.isEmpty()) {
+                System.out.println("⚠️ No room found for event: " + eventId);
+                return;
+            }
+
+            ObjectMapper mapper = new ObjectMapper();
+            Map<String, Object> roomData = mapper.readValue(eventJson, new TypeReference<Map<String, Object>>() {
+            });
+            Map<Integer, Map<String, Object>> participantsMap = (Map<Integer, Map<String, Object>>) roomData
+                    .get("participants");
+
+            if (participantsMap == null || participantsMap.isEmpty()) {
+                System.out.println("⚠️ No participants in room: " + eventId);
+                return;
+            }
+
+            String jsonMessage = mapper.writeValueAsString(payload);
+            TextMessage textMessage = new TextMessage(jsonMessage);
+
+            for (Map<String, Object> participant : participantsMap.values()) {
+                String participantId = (String) participant.get("participantId");
+                String sessionKey = "event_participant_session:" + participantId;
+                String sessionId = stringRedisTemplate.opsForValue().get(sessionKey);
+
+                if (sessionId != null) {
+                    WebSocketSession session = sessionManager.getSession(sessionId);
+                    if (session != null && session.isOpen()) {
+                        try {
+                            session.sendMessage(textMessage);
+                        } catch (IOException e) {
+                            System.out.println("❌ Failed to send to session " + sessionId + ": " + e.getMessage());
+                            stringRedisTemplate.delete(sessionKey);
+                            sessionManager.removeSession(sessionId);
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            System.out.println("❌ Error in broadcastToAllSessions: " + e.getMessage());
+        }
+    }
+
+    
+    private void handleUserInviteCohost(String eventId, String participantId) {
+        try {
+            // 1. Fetch room data from Redis
+            String redisKey = "event_room:" + eventId;
+            String eventJson = stringRedisTemplate.opsForValue().get(redisKey);
+
+            if (eventJson == null || eventJson.isEmpty()) {
+                System.out.println("Room not found for eventId: " + eventId);
+                return;
+            }
+
+            ObjectMapper mapper = new ObjectMapper();
+            Map<String, Object> roomData = mapper.readValue(eventJson, new TypeReference<>() {
+            });
+            Map<Integer, Map<String, Object>> participants = (Map<Integer, Map<String, Object>>) roomData
+                    .get("participants");
+
+            if (participants == null || participants.isEmpty())
+                return;
+
+            // 2. Check participant exists
+            boolean participantExists = participants.values().stream()
+                    .anyMatch(p -> participantId.equals(p.get("participantId")));
+
+            if (!participantExists) {
+                System.out.println("Participant not found: " + participantId);
+                return;
+            }
+
+            // 3. Get participant's session from Redis
+            String sessionKey = "event_participant_session:" + participantId;
+            String sessionId = stringRedisTemplate.opsForValue().get(sessionKey);
+
+            if (sessionId == null) {
+                System.out.println("Session ID not found for participant: " + participantId);
+                return;
+            }
+
+            WebSocketSession participantSession = sessionManager.getSession(sessionId);
+            if (participantSession != null && participantSession.isOpen()) {
+                // 4. Prepare the co-host invitation payload
+                Map<String, Object> payload = new HashMap<>();
+                payload.put("type", "cohost_invite");
+                payload.put("message", "You've been invited to be a co-host on this event.");
+                payload.put("timestamp", Instant.now().toString());
+
+                String json = mapper.writeValueAsString(payload);
+                participantSession.sendMessage(new TextMessage(json));
+            } else {
+                System.out.println("❌ WebSocket session is closed or missing for " + participantId);
+            }
+        } catch (Exception e) {
+            System.out.println("Error inviting co-host: " + e.getMessage());
+        }
+    }
+
+
+    private void handleUserAcceptCohost(String eventId, String participantId) {
+        try {
+            // 1. Fetch room data from Redis
+            String redisKey = "event_room:" + eventId;
+            String eventJson = stringRedisTemplate.opsForValue().get(redisKey);
+
+            if (eventJson == null || eventJson.isEmpty()) {
+                System.out.println("Room not found for eventId: " + eventId);
+                return;
+            }
+
+            ObjectMapper mapper = new ObjectMapper();
+            Map<String, Object> roomData = mapper.readValue(eventJson, new TypeReference<>() {
+            });
+            Map<Integer, Map<String, Object>> participantsMap = (Map<Integer, Map<String, Object>>) roomData
+                    .get("participants");
+
+            if (participantsMap == null || participantsMap.isEmpty()) {
+                System.out.println("No participants found in room");
+                return;
+            }
+
+            // 2. Find and update the participant's co-host status
+            boolean participantFound = false;
+            for (Map.Entry<Integer, Map<String, Object>> entry : participantsMap.entrySet()) {
+                Map<String, Object> participant = entry.getValue();
+                if (participantId.equals(participant.get("participantId"))) {
+                    participant.put("is_cohost", true);
+                    participantFound = true;
+                    break;
+                }
+            }
+
+            if (!participantFound) {
+                System.out.println("Participant not found in room: " + participantId);
+                return;
+            }
+
+            // 3. Update Redis with the modified participant data
+            roomData.put("participants", participantsMap);
+            stringRedisTemplate.opsForValue().set(redisKey, mapper.writeValueAsString(roomData));
+
+            // 4. Get the participant's username for notification
+            String username = (String) participantsMap.values().stream()
+                    .filter(p -> participantId.equals(p.get("participantId")))
+                    .findFirst()
+                    .map(p -> p.get("username"))
+                    .orElse("A participant");
+
+            // 5. Prepare notification message
+            Map<String, Object> notificationPayload = new HashMap<>();
+            notificationPayload.put("type", "cohost_joined");
+            notificationPayload.put("message", username + " is now a co-host");
+            notificationPayload.put("participant_id", participantId);
+            notificationPayload.put("isCoHost", true);
+            notificationPayload.put("username", username);
+            notificationPayload.put("timestamp", Instant.now().toString());
+
+            String notificationMessage = mapper.writeValueAsString(notificationPayload);
+            TextMessage textMessage = new TextMessage(notificationMessage);
+
+            // 6. Broadcast notification to all participants and host
+            // Send to participants
+            for (Map<String, Object> participant : participantsMap.values()) {
+                String pid = (String) participant.get("participantId");
+                String sessionKey = "event_participant_session:" + pid;
+                String sessionId = stringRedisTemplate.opsForValue().get(sessionKey);
+
+                if (sessionId != null) {
+                    WebSocketSession session = sessionManager.getSession(sessionId);
+                    if (session != null && session.isOpen()) {
+                        try {
+                            session.sendMessage(textMessage);
+                        } catch (IOException e) {
+                            stringRedisTemplate.delete(sessionKey);
+                            sessionManager.removeSession(sessionId);
+                            System.out.println("Cleaned up disconnected participant session: " + pid);
+                        }
+                    }
+                }
+            }
+
+            // Send to host
+            Map<String, Object> hostDetails = (Map<String, Object>) roomData.get("hostDetails");
+            if (hostDetails != null) {
+                String hostId = (String) roomData.get("hostId");
+                String hostSessionKey = "event_host_session:" + hostId;
+                String hostSessionId = stringRedisTemplate.opsForValue().get(hostSessionKey);
+
+                if (hostSessionId != null) {
+                    WebSocketSession hostSession = sessionManager.getSession(hostSessionId);
+                    if (hostSession != null && hostSession.isOpen()) {
+                        try {
+                            hostSession.sendMessage(textMessage);
+                        } catch (IOException e) {
+                            System.out.println("Failed to send to host: " + e.getMessage());
+                            stringRedisTemplate.delete(hostSessionKey);
+                            sessionManager.removeSession(hostSessionId);
+                        }
+                    }
+                }
+            }
+
+            // 7. Broadcast updated participant list to everyone
+            broadcastParticipantList(eventId);
+
+        } catch (Exception e) {
+            System.out.println("Error handling co-host acceptance: " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+
+
+    private void handleUserExistRoom(String eventId, String participantId) {
+        try {
+            // 1. Fetch room data from Redis
+            String redisKey = "event_room:" + eventId;
+            String eventJson = stringRedisTemplate.opsForValue().get(redisKey);
+
+            if (eventJson == null || eventJson.isEmpty()) {
+                System.out.println("Room not found for eventId: " + eventId);
+                return;
+            }
+
+            ObjectMapper mapper = new ObjectMapper();
+            Map<String, Object> roomData = mapper.readValue(eventJson, new TypeReference<>() {
+            });
+            Map<Integer, Map<String, Object>> participantsMap = (Map<Integer, Map<String, Object>>) roomData
+                    .get("participants");
+
+            if (participantsMap == null || participantsMap.isEmpty()) {
+                System.out.println("No participants found in room");
+                return;
+            }
+
+            // 2. Find and remove the participant
+            String username = null;
+            Iterator<Map.Entry<Integer, Map<String, Object>>> iterator = participantsMap.entrySet().iterator();
+            while (iterator.hasNext()) {
+                Map.Entry<Integer, Map<String, Object>> entry = iterator.next();
+                Map<String, Object> participant = entry.getValue();
+                if (participantId.equals(participant.get("participantId"))) {
+                    username = (String) participant.get("username");
+                    iterator.remove();
+                    break;
+                }
+            }
+
+            if (username == null) {
+                System.out.println("Participant not found in room: " + participantId);
+                return;
+            }
+
+            // 3. Update participant count
+            int currentCount = ((Number) roomData.getOrDefault("total_participants", 0)).intValue();
+            roomData.put("total_participants", Math.max(0, currentCount - 1));
+
+            // 4. Update Redis
+            roomData.put("participants", participantsMap);
+            stringRedisTemplate.opsForValue().set(redisKey, mapper.writeValueAsString(roomData));
+
+            // 5. Clean up participant session
+            String sessionKey = "event_participant_session:" + participantId;
+            stringRedisTemplate.delete(sessionKey);
+
+            // 6. Prepare leave notification
+            Map<String, Object> leavePayload = new HashMap<>();
+            leavePayload.put("type", "participant_left");
+            leavePayload.put("message", username + " left the room");
+            leavePayload.put("participantId", participantId);
+            leavePayload.put("timestamp", Instant.now().toString());
+
+            String leaveMessage = mapper.writeValueAsString(leavePayload);
+            TextMessage leaveTextMessage = new TextMessage(leaveMessage);
+
+            // 7. Broadcast leave notification to all participants and host
+            // Send to participants
+            for (Map<String, Object> participant : participantsMap.values()) {
+                String pid = (String) participant.get("participantId");
+                String pSessionKey = "event_participant_session:" + pid;
+                String pSessionId = stringRedisTemplate.opsForValue().get(pSessionKey);
+
+                if (pSessionId != null) {
+                    WebSocketSession session = sessionManager.getSession(pSessionId);
+                    if (session != null && session.isOpen()) {
+                        try {
+                            session.sendMessage(leaveTextMessage);
+                        } catch (IOException e) {
+                            stringRedisTemplate.delete(pSessionKey);
+                            sessionManager.removeSession(pSessionId);
+                        }
+                    }
+                }
+            }
+
+            // 8. Broadcast updated participant list and count
+            broadcastParticipantList(eventId);
+            broadcastParticipantCount(eventId);
+
+            // Send to host
+            Map<String, Object> hostDetails = (Map<String, Object>) roomData.get("hostDetails");
+            if (hostDetails != null) {
+                String hostId = (String) roomData.get("hostId");
+                String hostSessionKey = "event_host_session:" + hostId;
+                String hostSessionId = stringRedisTemplate.opsForValue().get(hostSessionKey);
+
+                if (hostSessionId != null) {
+                    WebSocketSession hostSession = sessionManager.getSession(hostSessionId);
+                    if (hostSession != null && hostSession.isOpen()) {
+                        try {
+                            hostSession.sendMessage(leaveTextMessage);
+                        } catch (IOException e) {
+                            System.out.println("Failed to send to host: " + e.getMessage());
+                        }
+                    }
+                }
+            }
+
+        } catch (Exception e) {
+            System.out.println("Error handling user exit: " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+
+
+    private void handleRemoveUserFromRoomByHost(String eventId, String participantId) {
+        try {
+            // 1. Fetch room data from Redis
+            String redisKey = "event_room:" + eventId;
+            String eventJson = stringRedisTemplate.opsForValue().get(redisKey);
+
+            if (eventJson == null || eventJson.isEmpty()) {
+                System.out.println("Room not found for eventId: " + eventId);
+                return;
+            }
+
+            ObjectMapper mapper = new ObjectMapper();
+            Map<String, Object> roomData = mapper.readValue(eventJson, new TypeReference<>() {
+            });
+            Map<Integer, Map<String, Object>> participantsMap = (Map<Integer, Map<String, Object>>) roomData
+                    .get("participants");
+
+            if (participantsMap == null || participantsMap.isEmpty()) {
+                System.out.println("No participants found in room");
+                return;
+            }
+
+            // 2. Find and remove the participant
+            String username = null;
+            Iterator<Map.Entry<Integer, Map<String, Object>>> iterator = participantsMap.entrySet().iterator();
+            while (iterator.hasNext()) {
+                Map.Entry<Integer, Map<String, Object>> entry = iterator.next();
+                Map<String, Object> participant = entry.getValue();
+                if (participantId.equals(participant.get("participantId"))) {
+                    username = (String) participant.get("username");
+                    iterator.remove();
+                    break;
+                }
+            }
+
+            if (username == null) {
+                System.out.println("Participant not found in room: " + participantId);
+                return;
+            }
+
+            // 3. Update participant count
+            int currentCount = ((Number) roomData.getOrDefault("total_participants", 0)).intValue();
+            roomData.put("total_participants", Math.max(0, currentCount - 1));
+
+            // 4. Update Redis
+            roomData.put("participants", participantsMap);
+            stringRedisTemplate.opsForValue().set(redisKey, mapper.writeValueAsString(roomData));
+
+            // 5. Clean up participant session
+            String sessionKey = "event_participant_session:" + participantId;
+            stringRedisTemplate.delete(sessionKey);
+
+            // 6. Prepare leave notification
+            Map<String, Object> leavePayload = new HashMap<>();
+            leavePayload.put("type", "participant_removed");
+            leavePayload.put("message", username + " has been removed from the room.");
+            leavePayload.put("participantId", participantId);
+            leavePayload.put("timestamp", Instant.now().toString());
+
+            String leaveMessage = mapper.writeValueAsString(leavePayload);
+            TextMessage leaveTextMessage = new TextMessage(leaveMessage);
+
+            // 7. Broadcast leave notification to all participants and host
+            // Send to participants
+            for (Map<String, Object> participant : participantsMap.values()) {
+                String pid = (String) participant.get("participantId");
+                String pSessionKey = "event_participant_session:" + pid;
+                String pSessionId = stringRedisTemplate.opsForValue().get(pSessionKey);
+
+                if (pSessionId != null) {
+                    WebSocketSession session = sessionManager.getSession(pSessionId);
+                    if (session != null && session.isOpen()) {
+                        try {
+                            session.sendMessage(leaveTextMessage);
+                        } catch (IOException e) {
+                            stringRedisTemplate.delete(pSessionKey);
+                            sessionManager.removeSession(pSessionId);
+                        }
+                    }
+                }
+            }
+
+            // 8. Broadcast updated participant list and count
+            broadcastParticipantList(eventId);
+            broadcastParticipantCount(eventId);
+
+            // Send to host
+            Map<String, Object> hostDetails = (Map<String, Object>) roomData.get("hostDetails");
+            if (hostDetails != null) {
+                String hostId = (String) roomData.get("hostId");
+                String hostSessionKey = "event_host_session:" + hostId;
+                String hostSessionId = stringRedisTemplate.opsForValue().get(hostSessionKey);
+
+                if (hostSessionId != null) {
+                    WebSocketSession hostSession = sessionManager.getSession(hostSessionId);
+                    if (hostSession != null && hostSession.isOpen()) {
+                        try {
+                            hostSession.sendMessage(leaveTextMessage);
+                        } catch (IOException e) {
+                            System.out.println("Failed to send to host: " + e.getMessage());
+                        }
+                    }
+                }
+            }
+
+        } catch (Exception e) {
+            System.out.println("Error handling user exit: " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+
+    
+    private void handleRemoveCohost(String eventId, String participantId) {
+        try {
+            // 1. Fetch room data from Redis
+            String redisKey = "event_room:" + eventId;
+            String eventJson = stringRedisTemplate.opsForValue().get(redisKey);
+
+            if (eventJson == null || eventJson.isEmpty()) {
+                System.out.println("Room not found for eventId: " + eventId);
+                return;
+            }
+
+            ObjectMapper mapper = new ObjectMapper();
+            Map<String, Object> roomData = mapper.readValue(eventJson, new TypeReference<>() {
+            });
+            Map<Integer, Map<String, Object>> participantsMap = (Map<Integer, Map<String, Object>>) roomData
+                    .get("participants");
+
+            if (participantsMap == null || participantsMap.isEmpty()) {
+                System.out.println("No participants found in room");
+                return;
+            }
+
+            // 2. Find and update the participant's co-host status to false
+            boolean participantFound = false;
+            String username = null;
+            for (Map.Entry<Integer, Map<String, Object>> entry : participantsMap.entrySet()) {
+                Map<String, Object> participant = entry.getValue();
+                if (participantId.equals(participant.get("participantId"))) {
+                    participant.put("is_cohost", false);
+                    username = (String) participant.get("username");
+                    participantFound = true;
+                    break;
+                }
+            }
+
+            if (!participantFound) {
+                System.out.println("Participant not found in room: " + participantId);
+                return;
+            }
+
+            // 3. Update Redis with the modified participant data
+            roomData.put("participants", participantsMap);
+            stringRedisTemplate.opsForValue().set(redisKey, mapper.writeValueAsString(roomData));
+
+            // 4. Prepare removal notification
+            Map<String, Object> notificationPayload = new HashMap<>();
+            notificationPayload.put("type", "cohost_removed");
+            notificationPayload.put("message", username + " has been removed as co-host");
+            notificationPayload.put("participant_id", participantId);
+            notificationPayload.put("isCoHost", false);
+            notificationPayload.put("username", username);
+            notificationPayload.put("timestamp", Instant.now().toString());
+
+            String notificationMessage = mapper.writeValueAsString(notificationPayload);
+            TextMessage textMessage = new TextMessage(notificationMessage);
+
+            // 5. Broadcast notification to all participants and host
+            // Send to participants
+            for (Map<String, Object> participant : participantsMap.values()) {
+                String pid = (String) participant.get("participantId");
+                String sessionKey = "event_participant_session:" + pid;
+                String sessionId = stringRedisTemplate.opsForValue().get(sessionKey);
+
+                if (sessionId != null) {
+                    WebSocketSession session = sessionManager.getSession(sessionId);
+                    if (session != null && session.isOpen()) {
+                        try {
+                            session.sendMessage(textMessage);
+                        } catch (IOException e) {
+                            stringRedisTemplate.delete(sessionKey);
+                            sessionManager.removeSession(sessionId);
+                            System.out.println("Cleaned up disconnected participant session: " + pid);
+                        }
+                    }
+                }
+            }
+
+            // Send to host
+            Map<String, Object> hostDetails = (Map<String, Object>) roomData.get("hostDetails");
+            if (hostDetails != null) {
+                String hostId = (String) roomData.get("hostId");
+                String hostSessionKey = "event_host_session:" + hostId;
+                String hostSessionId = stringRedisTemplate.opsForValue().get(hostSessionKey);
+
+                if (hostSessionId != null) {
+                    WebSocketSession hostSession = sessionManager.getSession(hostSessionId);
+                    if (hostSession != null && hostSession.isOpen()) {
+                        try {
+                            hostSession.sendMessage(textMessage);
+                        } catch (IOException e) {
+                            System.out.println("Failed to send to host: " + e.getMessage());
+                            stringRedisTemplate.delete(hostSessionKey);
+                            sessionManager.removeSession(hostSessionId);
+                        }
+                    }
+                }
+            }
+
+            // 6. Broadcast updated participant list to everyone
+            broadcastParticipantList(eventId);
+
+        } catch (Exception e) {
+            System.out.println("Error removing co-host: " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+
+
+    private void handleChatMessage(String eventId, String message, String participantId) {
+        try {
+            long userIdLong = Long.parseLong(participantId);
+            Optional<Users> userdetails = userRepository.findById(userIdLong);
+
+            // 1. Prepare chat message payload
+            Map<String, Object> chatPayload = new HashMap<>();
+            chatPayload.put("type", "chat_message");
+            chatPayload.put("message", message);
+            chatPayload.put("username", userdetails.get().getUsername());
+            chatPayload.put("user_id", participantId);
+            chatPayload.put("timestamp", Instant.now().toString());
+
+            // 2. Store message in Redis chat history
+            String chatHistoryKey = "event_chat_history:" + eventId;
+            ObjectMapper mapper = new ObjectMapper();
+            stringRedisTemplate.opsForList().rightPush(chatHistoryKey, mapper.writeValueAsString(chatPayload));
+            
+            // Keep only the last 100 messages (optional)
+            stringRedisTemplate.opsForList().trim(chatHistoryKey, -100, -1);
+
+            // 3. Broadcast message to all participants and host
+            String redisKey = "event_room:" + eventId;
+            String eventJson = stringRedisTemplate.opsForValue().get(redisKey);
+            
+            if (eventJson != null && !eventJson.isEmpty()) {
+                Map<String, Object> roomData = mapper.readValue(eventJson, new TypeReference<>() {});
+                Map<Integer, Map<String, Object>> participantsMap = (Map<Integer, Map<String, Object>>) roomData.get("participants");
+
+                TextMessage textMessage = new TextMessage(mapper.writeValueAsString(chatPayload));
+
+                // Send to participants
+                if (participantsMap != null) {
+                    for (Map<String, Object> participant : participantsMap.values()) {
+                        String pid = (String) participant.get("participantId");
+                        String sessionKey = "event_participant_session:" + pid;
+                        String sessionId = stringRedisTemplate.opsForValue().get(sessionKey);
+
+                        if (sessionId != null) {
+                            WebSocketSession session = sessionManager.getSession(sessionId);
+                            if (session != null && session.isOpen()) {
+                                try {
+                                    session.sendMessage(textMessage);
+                                } catch (IOException e) {
+                                    stringRedisTemplate.delete(sessionKey);
+                                    sessionManager.removeSession(sessionId);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Send to host
+                Map<String, Object> hostDetails = (Map<String, Object>) roomData.get("hostDetails");
+                if (hostDetails != null) {
+                    String hostId = (String) roomData.get("hostId");
+                    String hostSessionKey = "event_host_session:" + hostId;
+                    String hostSessionId = stringRedisTemplate.opsForValue().get(hostSessionKey);
+
+                    if (hostSessionId != null) {
+                        WebSocketSession hostSession = sessionManager.getSession(hostSessionId);
+                        if (hostSession != null && hostSession.isOpen()) {
+                            try {
+                                hostSession.sendMessage(textMessage);
+                            } catch (IOException e) {
+                                System.out.println("Failed to send chat to host: " + e.getMessage());
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            System.out.println("Error handling chat message: " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+
+
+    private void sendChatHistory(String eventId, String targetParticipantId) {
+        try {
+            // 1. Get chat history from Redis
+            String chatHistoryKey = "event_chat_history:" + eventId;
+            List<String> chatMessages = stringRedisTemplate.opsForList().range(chatHistoryKey, 0, -1);
+
+            if (chatMessages == null || chatMessages.isEmpty()) {
+                return;
+            }
+
+            // 2. Parse messages and prepare payload
+            ObjectMapper mapper = new ObjectMapper();
+            List<Map<String, Object>> messages = chatMessages.stream()
+                    .map(msg -> {
+                        try {
+                            return mapper.readValue(msg, new TypeReference<Map<String, Object>>() {
+                            });
+                        } catch (JsonProcessingException e) {
+                            return null;
+                        }
+                    })
+                    .filter(Objects::nonNull)
+                    .collect(Collectors.toList());
+
+            // 3. Prepare chat history payload
+            Map<String, Object> payload = new HashMap<>();
+            payload.put("type", "chat_history");
+            payload.put("messages", messages);
+            String jsonPayload = mapper.writeValueAsString(payload);
+            TextMessage textMessage = new TextMessage(jsonPayload);
+
+            // 4. Get the target participant's session
+            String sessionKey = "event_participant_session:" + targetParticipantId;
+            String sessionId = stringRedisTemplate.opsForValue().get(sessionKey);
+
+            if (sessionId != null) {
+                WebSocketSession session = sessionManager.getSession(sessionId);
+                if (session != null && session.isOpen()) {
+                    try {
+                        session.sendMessage(textMessage);
+                    } catch (IOException e) {
+                        stringRedisTemplate.delete(sessionKey);
+                        sessionManager.removeSession(sessionId);
+                        System.out.println("Failed to send chat history to participant " + targetParticipantId);
+                    }
+                }
+            }
+        } catch (Exception e) {
+            System.out.println("Error sending chat history: " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+    
 }
